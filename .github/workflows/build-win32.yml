@@ -1,0 +1,204 @@
+name: Build SoftEther Win32
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-win32:
+    name: Build Windows x86
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          Write-Host "Windows:"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture
+
+          Write-Host "`nVisual Studio installations:"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -products * `
+            -format table
+
+      - name: Configure MSVC x86 environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio with C++ tools was not found."
+          }
+
+          Write-Host "Visual Studio: $vsPath"
+
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+
+          if (-not (Test-Path $vcvars)) {
+            throw "vcvarsall.bat not found: $vcvars"
+          }
+
+          # Load the 32-bit compiler environment.
+          cmd /c "`"$vcvars`" x86 && set" |
+            ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') {
+                "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+              }
+            }
+
+      - name: Verify compiler
+        shell: cmd
+        run: |
+          where cl
+          cl
+          where link
+          link
+
+      - name: Verify MSBuild
+        shell: pwsh
+        run: |
+          $msbuild = Get-ChildItem `
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
+            -Filter MSBuild.exe `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $msbuild) {
+            throw "MSBuild.exe was not found."
+          }
+
+          Write-Host "Using MSBuild: $msbuild"
+          & $msbuild -version
+
+          "MSBUILD_EXE=$msbuild" >> $env:GITHUB_ENV
+
+      - name: Build BuildUtil
+        shell: cmd
+        run: |
+          if exist src\bin\BuildUtil.exe del /f /q src\bin\BuildUtil.exe
+
+          "%MSBUILD_EXE%" ^
+            src\BuildUtil\BuildUtil.csproj ^
+            /t:Rebuild ^
+            /p:Configuration=Debug ^
+            /p:Platform=AnyCPU ^
+            /verbosity:minimal
+
+      - name: Run SoftEther Win32 build
+        shell: cmd
+        run: |
+          src\bin\BuildUtil.exe /CMD:All
+
+      - name: Locate output
+        shell: pwsh
+        run: |
+          Write-Host "===== OUTPUT DIRECTORY ====="
+
+          if (Test-Path "output") {
+            Get-ChildItem output -Recurse |
+              Select-Object FullName, Length
+          } else {
+            Write-Host "No output directory found."
+          }
+
+          Write-Host "`n===== SRC BIN ====="
+
+          if (Test-Path "src\bin") {
+            Get-ChildItem src\bin -Recurse |
+              Select-Object FullName, Length
+          }
+
+      - name: Verify x86 executables
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path . -Recurse -File `
+            -Include vpnserver.exe,vpncmd.exe,vpnbridge.exe,vpnclient.exe `
+            -ErrorAction SilentlyContinue
+
+          if (-not $files) {
+            throw "No expected SoftEther executable was produced."
+          }
+
+          foreach ($file in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+
+            if ($bytes.Length -lt 64) {
+              throw "$($file.FullName) is too small to be a PE executable."
+            }
+
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+
+            if ($peOffset + 6 -ge $bytes.Length) {
+              throw "$($file.FullName) has an invalid PE header."
+            }
+
+            $signature = [System.Text.Encoding]::ASCII.GetString(
+              $bytes,
+              $peOffset,
+              4
+            )
+
+            $machine = [BitConverter]::ToUInt16(
+              $bytes,
+              $peOffset + 4
+            )
+
+            Write-Host "$($file.FullName)"
+            Write-Host "  PE signature: $signature"
+            Write-Host ("  Machine: 0x{0:X4}" -f $machine)
+
+            if ($signature -ne "PE`0`0") {
+              throw "$($file.FullName) is not a valid PE file."
+            }
+
+            # IMAGE_FILE_MACHINE_I386 = 0x014c
+            if ($machine -ne 0x014c) {
+              throw "$($file.FullName) is NOT x86."
+            }
+          }
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          if (Test-Path output) {
+            Copy-Item output artifacts\output -Recurse -Force
+          }
+
+          if (Test-Path src\bin) {
+            New-Item -ItemType Directory -Force -Path artifacts\bin | Out-Null
+
+            Get-ChildItem src\bin -File |
+              Copy-Item -Destination artifacts\bin -Force
+          }
+
+          Compress-Archive `
+            -Path artifacts\* `
+            -DestinationPath SoftEther-Win32-Build.zip `
+            -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoftEther-Win32-Build
+          path: SoftEther-Win32-Build.zip
+          if-no-files-found: error
+          retention-days: 7
