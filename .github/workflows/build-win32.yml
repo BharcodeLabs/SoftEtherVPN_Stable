@@ -79,7 +79,6 @@ jobs:
               $name = $matches[1]
               $value = $matches[2]
 
-              # Don't overwrite GitHub's internal variables.
               if ($name -notmatch '^GITHUB_' -and
                   $name -notmatch '^RUNNER_') {
                 "$name=$value" | Out-File `
@@ -93,14 +92,26 @@ jobs:
       - name: Verify x86 compiler
         shell: cmd
         run: |
-          echo ===== CL.EXE =====
+          echo ===== CL.EXE LOCATION =====
           where cl
-          cl
 
           echo.
-          echo ===== LINK.EXE =====
+          echo ===== CL.EXE VERSION / TARGET =====
+          cl /Bv
+          echo CL_EXIT=%ERRORLEVEL%
+
+          echo.
+          echo ===== LINK.EXE LOCATION =====
           where link
-          link
+
+          echo.
+          echo ===== LINK.EXE VERSION =====
+          link /? >nul 2>&1
+          echo LINK_EXIT=%ERRORLEVEL%
+
+          echo.
+          echo Compiler verification completed.
+          exit /b 0
 
       - name: Locate MSBuild
         shell: pwsh
@@ -222,7 +233,6 @@ jobs:
               throw "$($file.FullName) is not a valid PE executable."
             }
 
-            # 0x014C = Intel 386 / x86
             if ($machine -ne 0x014c) {
               throw "$($file.FullName) is NOT x86."
             }
