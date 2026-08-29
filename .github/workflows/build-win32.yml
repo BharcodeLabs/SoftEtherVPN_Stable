@@ -1,4 +1,4 @@
-name: Build SoftEther Win32
+name: Build SoftEther Windows x86
 
 on:
   workflow_dispatch:
@@ -22,31 +22,47 @@ jobs:
       - name: Show environment
         shell: pwsh
         run: |
-          Write-Host "Windows:"
+          Write-Host "===== WINDOWS ====="
           Get-CimInstance Win32_OperatingSystem |
             Select-Object Caption, Version, OSArchitecture
 
-          Write-Host "`nVisual Studio installations:"
-          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+          Write-Host ""
+          Write-Host "===== VISUAL STUDIO ====="
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found."
+          }
+
+          & $vswhere -products * -property installationPath
+
+          Write-Host ""
+          Write-Host "===== MSVC INSTALLATION ====="
+
+          & $vswhere `
+            -latest `
             -products * `
-            -format table
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
 
       - name: Configure MSVC x86 environment
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 
-          $vsPath = & $vswhere `
+          $vsPath = (& $vswhere `
             -latest `
             -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
+            -property installationPath).Trim()
 
           if (-not $vsPath) {
-            throw "Visual Studio with C++ tools was not found."
+            throw "Visual Studio C++ x86/x64 tools were not found."
           }
 
-          Write-Host "Visual Studio: $vsPath"
+          Write-Host "Visual Studio path:"
+          Write-Host $vsPath
 
           $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
 
@@ -54,100 +70,137 @@ jobs:
             throw "vcvarsall.bat not found: $vcvars"
           }
 
-          # Load the 32-bit compiler environment.
-          cmd /c "`"$vcvars`" x86 && set" |
-            ForEach-Object {
-              if ($_ -match '^([^=]+)=(.*)$') {
-                "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+          Write-Host "Loading x86 compiler environment..."
+
+          $envOutput = cmd.exe /c "`"$vcvars`" x86 && set"
+
+          foreach ($line in $envOutput) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $name = $matches[1]
+              $value = $matches[2]
+
+              # Don't overwrite GitHub's internal variables.
+              if ($name -notmatch '^GITHUB_' -and
+                  $name -notmatch '^RUNNER_') {
+                "$name=$value" | Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Append `
+                  -Encoding utf8
               }
             }
+          }
 
-      - name: Verify compiler
+      - name: Verify x86 compiler
         shell: cmd
         run: |
+          echo ===== CL.EXE =====
           where cl
           cl
+
+          echo.
+          echo ===== LINK.EXE =====
           where link
           link
 
-      - name: Verify MSBuild
+      - name: Locate MSBuild
         shell: pwsh
         run: |
-          $msbuild = Get-ChildItem `
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
-            -Filter MSBuild.exe `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty FullName
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+          )
+
+          $msbuild = $candidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
 
           if (-not $msbuild) {
-            throw "MSBuild.exe was not found."
+            throw "MSBuild.exe not found."
           }
 
-          Write-Host "Using MSBuild: $msbuild"
+          Write-Host "MSBuild:"
+          Write-Host $msbuild
+
           & $msbuild -version
 
-          "MSBUILD_EXE=$msbuild" >> $env:GITHUB_ENV
+          "MSBUILD_EXE=$msbuild" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append `
+            -Encoding utf8
 
-      - name: Build BuildUtil
+      - name: Build SoftEther BuildUtil
         shell: cmd
         run: |
-          if exist src\bin\BuildUtil.exe del /f /q src\bin\BuildUtil.exe
+          echo ===== BUILDUTIL =====
+
+          if exist src\bin\BuildUtil.exe (
+            del /f /q src\bin\BuildUtil.exe
+          )
 
           "%MSBUILD_EXE%" ^
             src\BuildUtil\BuildUtil.csproj ^
             /t:Rebuild ^
             /p:Configuration=Debug ^
             /p:Platform=AnyCPU ^
-            /verbosity:minimal
+            /verbosity:normal
 
-      - name: Run SoftEther Win32 build
+      - name: Run SoftEther build
         shell: cmd
         run: |
+          echo ===== SOFTETHER BUILD =====
+
+          if not exist src\bin\BuildUtil.exe (
+            echo BuildUtil.exe was not produced.
+            exit /b 1
+          )
+
           src\bin\BuildUtil.exe /CMD:All
 
-      - name: Locate output
+      - name: Inspect build output
+        if: always()
         shell: pwsh
         run: |
-          Write-Host "===== OUTPUT DIRECTORY ====="
+          Write-Host "===== OUTPUT ====="
 
-          if (Test-Path "output") {
-            Get-ChildItem output -Recurse |
+          if (Test-Path output) {
+            Get-ChildItem output -Recurse -File |
               Select-Object FullName, Length
-          } else {
-            Write-Host "No output directory found."
+          }
+          else {
+            Write-Host "output directory does not exist."
           }
 
-          Write-Host "`n===== SRC BIN ====="
+          Write-Host ""
+          Write-Host "===== SRC BIN ====="
 
-          if (Test-Path "src\bin") {
-            Get-ChildItem src\bin -Recurse |
+          if (Test-Path src\bin) {
+            Get-ChildItem src\bin -Recurse -File |
               Select-Object FullName, Length
           }
 
       - name: Verify x86 executables
+        if: always()
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path . -Recurse -File `
+          $files = Get-ChildItem . -Recurse -File `
             -Include vpnserver.exe,vpncmd.exe,vpnbridge.exe,vpnclient.exe `
             -ErrorAction SilentlyContinue
 
           if (-not $files) {
-            throw "No expected SoftEther executable was produced."
+            Write-Host "No expected SoftEther executables found."
+            exit 1
           }
 
           foreach ($file in $files) {
             $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
 
             if ($bytes.Length -lt 64) {
-              throw "$($file.FullName) is too small to be a PE executable."
+              throw "$($file.FullName) is too small."
             }
 
             $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
-
-            if ($peOffset + 6 -ge $bytes.Length) {
-              throw "$($file.FullName) has an invalid PE header."
-            }
 
             $signature = [System.Text.Encoding]::ASCII.GetString(
               $bytes,
@@ -160,21 +213,25 @@ jobs:
               $peOffset + 4
             )
 
-            Write-Host "$($file.FullName)"
-            Write-Host "  PE signature: $signature"
-            Write-Host ("  Machine: 0x{0:X4}" -f $machine)
+            Write-Host ""
+            Write-Host "File: $($file.FullName)"
+            Write-Host "PE: $signature"
+            Write-Host ("Machine: 0x{0:X4}" -f $machine)
 
             if ($signature -ne "PE`0`0") {
-              throw "$($file.FullName) is not a valid PE file."
+              throw "$($file.FullName) is not a valid PE executable."
             }
 
-            # IMAGE_FILE_MACHINE_I386 = 0x014c
+            # 0x014C = Intel 386 / x86
             if ($machine -ne 0x014c) {
               throw "$($file.FullName) is NOT x86."
             }
+
+            Write-Host "Architecture: x86 ✓"
           }
 
       - name: Package build
+        if: success()
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
@@ -196,6 +253,7 @@ jobs:
             -Force
 
       - name: Upload build artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SoftEther-Win32-Build
